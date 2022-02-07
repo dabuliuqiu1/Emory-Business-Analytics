@@ -1,0 +1,73 @@
+static = spark.read.json("s3://671sparkzhua273/activity-data/data/") 
+static.take(2)
+dataSchema = static.schema
+
+path = "s3://671sparkzhua273/activity-data/data/"
+streaming = spark.readStream.schema(dataSchema).option("maxFilesPerTrigger", 5).json(path)
+withEventTime = streaming.selectExpr("*","cast(cast(Creation_Time as double)/1000000000 as timestamp) as event_time")
+
+from pyspark.sql.functions import window, col
+activityMeans = withEventTime.groupBy(window(col("event_time"), "5 minutes"),"gt")\
+                .agg({'gt':'count', 'x':'avg', 'y':'avg', 'z':'avg'})
+
+
+# QueryQ1.stop()
+QueryQ1 = activityMeans\
+            .writeStream.queryName("pyevents_per_window").format("memory")\
+            .option("checkpointLocation","s3://671sparkzhua273/activity-data/test13").outputMode("complete").start()
+
+from time import sleep
+for x in range(19):
+    spark.sql("SELECT * FROM pyevents_per_window").show()
+sleep(15)
+
+
+# Q2(A) standing recommendation
+
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+
+t1 = static.selectExpr("*","cast(cast(Creation_Time as double)/1000000000 as timestamp) as event_time")
+
+df = t1.groupBy(window(col("event_time"), "15 minutes"),"gt").agg({'gt':'count', 'x':'avg', 'y':'avg', 'z':'avg'})
+
+my_window = Window.partitionBy('window').orderBy(["gt"])
+
+dff = df.filter((df.gt=="sit")|(df.gt=="stand"))\
+        .withColumn("prev_value", F.lag('count(gt)').over(my_window))\
+        .select("window","gt","count(gt)","prev_value")
+
+dff = dff.withColumn("count", F.count('gt').over(Window.partitionBy('window')))
+
+dff = dff.withColumn("diff", F.when(F.isnull(col('count(gt)') - col('prev_value')), 1)\
+         .otherwise(col('count(gt)') - col('prev_value')))
+
+dff = dff.withColumn("recommand_standing", F.when(col('diff')<0, "yes")\
+         .otherwise(F.when( (col('count')==1) & (col('gt')=="sit"), "yes")\
+         .otherwise("no")))
+
+w2 = Window.partitionBy("window").orderBy(col("gt").desc())
+
+dff.withColumn("row",F.row_number().over(w2))\
+      .filter(col("row") == 1).drop("row")\
+      .select("window","recommand_standing").show()
+
+
+# Q2(B) moving recommendation
+
+df2 = df.groupBy("window").agg({'avg(x)':'avg', 'avg(y)':'avg', 'avg(z)':'avg'}).sort("window")
+
+dff2 = df2.withColumn("prev_x", F.lag('avg(avg(x))').over(Window.partitionBy().orderBy(["window"])))
+dff2 = dff2.withColumn("prev_y", F.lag('avg(avg(y))').over(Window.partitionBy().orderBy(["window"])))
+dff2 = dff2.withColumn("prev_z", F.lag('avg(avg(z))').over(Window.partitionBy().orderBy(["window"])))
+
+dff2 = dff2.withColumn("dist", F.sqrt(F.pow(col("avg(avg(x))")-col("prev_x"),2) +\
+                                      F.pow(col("avg(avg(y))")-col("prev_y"),2) +\
+                                      F.pow(col("avg(avg(z))")-col("prev_z"),2)))
+
+dff2 = dff2.withColumn("prev_dist", F.lag('dist').over(Window.partitionBy().orderBy(["window"])))
+
+dff2 = dff2.withColumn("recommand_moving", F.when(col('dist')<col('prev_dist'), "yes")\
+         .otherwise("no"))
+
+dff2.select("window","recommand_moving").show()
